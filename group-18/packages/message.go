@@ -1,11 +1,12 @@
 package minichord
 
 import (
-	"google.golang.org/protobuf/proto"
 	"encoding/binary"
 	"io"
 	"log"
 	"net"
+
+	"google.golang.org/protobuf/proto"
 )
 
 const I64SIZE = 8
@@ -13,7 +14,6 @@ const I64SIZE = 8
 // ReceiveMiniChordMessage receives a protobuf marshaled message on
 // a connection conn and unmarshals it.
 // Make sure to call this function from only one go routine at a time.
-//
 func ReceiveMiniChordMessage(conn net.Conn) (message *MiniChord, err error) {
 	// First, get the number of bytes to received
 	bs := make([]byte, I64SIZE)
