@@ -1,17 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"os"
+	"strings"
 
 	minichord "github.com/mkyas/minichord/packages"
 )
 
 // Node information storage
 type Node struct {
-	id      int32  // stores assigned id from registry
-	address string // stores address used in registry
+	id          int32                       // stores assigned id from registry
+	address     string                      // stores address used in registry
+	fingerTable []*minichord.Deregistration // list of IDs
 }
 
 // handles creation and sending of registration message using protobuf
@@ -57,6 +60,32 @@ func DeregisterSelf(conn net.Conn, n *Node) {
 	}
 }
 
+func HandleIncomingMessage(conn net.Conn, n *Node) {
+	defer conn.Close()
+
+	for {
+		message, err := minichord.ReceiveMiniChordMessage(conn)
+		if err != nil {
+			fmt.Println("Messenger disconnected")
+			return // need to kill the goroutine...
+		}
+
+		// Case 1: Setup - Node Overlay
+		if nodeRegistry := message.GetNodeRegistry(); nodeRegistry != nil {
+			fmt.Printf("\nReceived updated finger table with %d entries.\n", nodeRegistry.NR)
+			n.fingerTable = nodeRegistry.Peers
+
+			// TODO:  initiate connections to the nodes that comprise its finger table
+
+			// Initialise a node registry response
+			// nodeRegistryResponse := &minichord.NodeRegistryResponse{
+			// 	Result: ,
+			// 	Info "Recieved",
+			// }
+		}
+	}
+}
+
 // TODO: Helper: print information to the console about the number of messages sent, received, and relayed, along with the sums for the messages sent from and received at the node.
 func Print() {
 
@@ -64,7 +93,20 @@ func Print() {
 
 // TODO: Helper: allows a messaging node to exit the overlay. The messaging node should first send a deregistration message (see Section 2.2) to the registry and await a response before exiting and terminating the process.
 func Exit() {
+	// Temp placement -- will clean up later!!
+	// DeregisterSelf(conn, n)
 
+	// // Registeration - await confirmation that it has been deregistered
+	// deregResponse, deregErr := minichord.ReceiveMiniChordMessage(conn)
+	// if deregErr != nil {
+	// 	fmt.Println("Error receiving response:", deregErr)
+	// 	return
+	// }
+
+	// // Check if connection works
+	// if response := deregResponse.GetRegistrationResponse(); response != nil {
+	// 	fmt.Printf("Deregistration of %d successful at %s", n.id, n.address)
+	// }
 }
 
 // Main program ------------------------------------------------------------------------------------
@@ -106,26 +148,33 @@ func main() {
 		fmt.Printf("Registration of %d successful at %s", n.id, n.address)
 	}
 
-	// TEMP PLACEMENT: Deregistration - end contact with registry
-	DeregisterSelf(conn, n)
+	// Setup active listener to registry -- awaiting commands and executions (Reference: minichord.pdf)
+	listener, _ := net.Listen("tcp", ":"+target)
 
-	// Registeration - await confirmation that it has been deregistered
-	deregResponse, deregErr := minichord.ReceiveMiniChordMessage(conn)
-	if deregErr != nil {
-		fmt.Println("Error receiving response:", deregErr)
-		return
+	// listen for connections in separate goroutine -- so we can still look for user inputs while this runs
+	go func() {
+		for {
+			conn, _ := listener.Accept()
+
+			HandleIncomingMessage(conn, n)
+		}
+	}()
+
+	// loop and wait for user inputs (Reference: minichord.pdf)
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		cmd, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Println(err)
+			break
+		}
+		cmd = strings.TrimSpace(cmd)
+		switch cmd {
+		case "exit":
+			Exit()
+		default:
+			fmt.Printf("Command not understood: %s", cmd)
+		}
 	}
-
-	// Check if connection works
-	if response := deregResponse.GetRegistrationResponse(); response != nil {
-		fmt.Printf("Deregistration of %d successful at %s", n.id, n.address)
-	}
-
-	// TODO: Sending messages to other nodes
-
-	// TEST CODE USING HELLO WORLD WILL REMOVE LATER
-	// conn.Write([]byte("Hello World"))
-	// recvBuffer := make([]byte, 1024)
-	// n, _ := conn.Read(recvBuffer[:])
-	// fmt.Println("Received from Server:", string(recvBuffer[:n]))
 }

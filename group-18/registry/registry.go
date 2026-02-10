@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 
 	minichord "github.com/mkyas/minichord/packages"
@@ -12,8 +16,56 @@ import (
 
 // Registry information storage
 type Registry struct {
-	messangers map[int32]string // key: random identifier (between 0–1023), value: given address
-	mutex      sync.RWMutex     // mutex: ensures safe access to Registry (Reference: https://gobyexample.com/mutexes)
+	messangers   map[int32]string  // key: random identifier (between 0–1023), value: given address
+	fingerTables map[int32][]int32 // key: node associated with finger table, value: list of IDs
+	mutex        sync.RWMutex      // mutex: ensures safe access to Registry (Reference: https://gobyexample.com/mutexes)
+}
+
+// Helper: List all currently registered messaging nodes’ hostname, port number, and node ID.
+func (r *Registry) List() {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	// Guard Clause: empty registry
+	if len(r.messangers) == 0 {
+		fmt.Println("The registry is currently empty.")
+		return
+	}
+
+	// Header Text
+	fmt.Println("\nRegistered Messaging Nodes")
+	fmt.Println("\nNode ID | Hostname/IP | Port")
+
+	// Print all rows
+	for id, address := range r.messangers {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			host = address
+			port = "?"
+		}
+		fmt.Printf("%d | %s | %s", id, host, port)
+	}
+}
+
+// Helper: List the computed finger tables for each node in the overlay.
+func (r *Registry) Route() {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	// Guard Clause: empty finger tables
+	if len(r.fingerTables) == 0 {
+		fmt.Println("The finger tables have not been setup.")
+		return
+	}
+
+	// Header Text
+	fmt.Println("\nOverlay Finger Tables")
+	fmt.Println("\nNode ID | Peers")
+
+	// Print all rows
+	for id, peers := range r.fingerTables {
+		fmt.Printf("%d | %d", id, peers)
+	}
 }
 
 // Registration: Adds new messanger to Registry
@@ -146,6 +198,7 @@ func HandleIncomingMessage(conn net.Conn, r *Registry) {
 				// TODO: in the rare case that a messaging node fails just after it sends a registration request, the registry cannot communicate with it.
 				// In this case, the registry removes the entry of the messaging node from the data structure maintained at the registry.
 			}
+			// Case 2: Deregistration
 		} else if deregisterReq := message.GetDeregistration(); deregisterReq != nil {
 			actualAddress := conn.RemoteAddr().String()
 
@@ -161,24 +214,94 @@ func HandleIncomingMessage(conn net.Conn, r *Registry) {
 	}
 }
 
-// TODO: Helper: List all currently registered messaging nodes’ hostname, port number, and node ID.
-func List() {
+// Helper: Find the first node in the sorted registered IDs that is >= to a provided target value
+func Successor(target int, sortedIDs []int) int {
+	// loop through sortedIDs
+	for _, id := range sortedIDs {
+		if id >= target {
+			return id
+		}
+	}
 
+	// If loop concludes, just give the smallest node
+	return sortedIDs[0]
 }
 
-// TODO: Helper: Setup the overlay with 𝑁𝑅 entries in the finger table.
-func SetupNR() {
+// Helper: Setup the overlay with 𝑁𝑅 entries in the finger table.
+func (r *Registry) SetupNR(nr int) error {
+	// Ensure no one is added or removed from the registry while we calculate the finger table
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 
-}
+	// sort the ids of all nodes -- from random to ascending order
+	var sortedIDs []int // use int so we can use sort later
+	for id := range r.messangers {
+		sortedIDs = append(sortedIDs, int(id))
+	}
+	sort.Ints(sortedIDs)
 
-// TODO: Helper: List the computed finger tables for each node in the overlay.
-func Route() {
+	// for every node, we calculate the finger table using formula: n >= p + 2^(i-1)
+	for _, nodeID := range sortedIDs {
+		temp := make([]int32, nr)
 
+		// apply formula to every slot in the finger table (corresponds to NR)
+		for i := 0; i < nr; i++ {
+			calculatedValue := (nodeID + int(math.Pow(2, float64(i)))) % 1024
+			temp[i] = int32(Successor(calculatedValue, sortedIDs))
+		}
+
+		// add the temp table to the registry at current nodeID
+		r.fingerTables[int32(nodeID)] = temp
+	}
+
+	// I know this would be so much faster using goroutines but i just want this to work first...
+	// install the finger table at every node -- use message NodeRegistry
+	for id, table := range r.fingerTables {
+		tempPeers := []*minichord.Deregistration{}
+		tempIds := []int32{}
+
+		for _, peer := range table {
+			peers := &minichord.Deregistration{
+				Id:      peer,
+				Address: r.messangers[peer],
+			}
+			tempPeers = append(tempPeers, peers)
+			tempIds = append(tempIds, peer)
+		}
+
+		// Initialise a registration response request
+		nodeRegistry := &minichord.NodeRegistry{
+			NR:    uint32(nr),
+			Peers: tempPeers,
+			NoIds: 8, // Not entirely sure if this is number of peers or number of unique peers?
+			Ids:   tempIds,
+		}
+
+		// Create Minichord, where message is assignable to MiniChord_DeregistrationResponse type
+		nodeRegistryMessage := &minichord.MiniChord{
+			Message: &minichord.MiniChord_NodeRegistry{
+				NodeRegistry: nodeRegistry,
+			},
+		}
+
+		conn, _ := net.Dial("tcp", r.messangers[int32(id)])
+		defer conn.Close()
+
+		// Send minichord to messager using SendMiniChordMessage
+		err := minichord.SendMiniChordMessage(conn, nodeRegistryMessage)
+		if err != nil {
+			return err
+		}
+
+		conn.Close()
+	}
+
+	return nil
 }
 
 // TODO: Helper: The start command makes the registry send the message TaskInitiate message to all nodes registered in the overlay. A command of start 50 results in each messaging node sending 50 packets to randomly chosen nodes.
-func Start() {
-
+func (r *Registry) Start(n int) {
+	//sending a message InitiateTask control message to all nodes
 }
 
 // Main program ------------------------------------------------------------------------------------
@@ -193,31 +316,43 @@ func main() {
 
 	// Initialise the registry
 	r := &Registry{
-		messangers: make(map[int32]string),
+		messangers:   make(map[int32]string),
+		fingerTables: make(map[int32][]int32),
 	}
 
 	// Setup connection (Reference: minichord.pdf)
 	listener, _ := net.Listen("tcp", ":"+port)
 
-	for {
-		conn, _ := listener.Accept()
+	// listen for connections in separate goroutine -- so we can still look for user inputs while this runs
+	go func() {
+		for {
+			conn, _ := listener.Accept()
 
-		// Rationale: creating a goroutine allows us to continue listening for other messenger nodes while this one is connected
-		go HandleIncomingMessage(conn, r)
+			// Rationale: creating a goroutine allows us to continue listening for other messenger nodes while this one is connected
+			go HandleIncomingMessage(conn, r)
+		}
+	}()
+
+	// loop and wait for user inputs (Reference: minichord.pdf)
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		cmd, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Println(err)
+			break
+		}
+		cmd = strings.TrimSpace(cmd)
+		switch cmd {
+		case "list":
+			r.List()
+		case "setup":
+			fmt.Println("setup")
+			//r.SetupNR(8)
+		case "start":
+			fmt.Println("start")
+		default:
+			fmt.Printf("Command not understood: %s", cmd)
+		}
 	}
 }
-
-// TEST CODE USING HELLO WORLD WILL REMOVE LATER
-// func testConnection(conn net.Conn) {
-// 	defer conn.Close()
-
-// 	for {
-// 		recvBuffer := make([]byte, 1024)
-// 		n, err := conn.Read(recvBuffer)
-// 		fmt.Println("Messenger sent:", string(recvBuffer[:n]))
-// 		if err != nil {
-// 			return
-// 		}
-// 		conn.Write(recvBuffer[:n])
-// 	}
-// }
