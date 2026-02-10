@@ -46,8 +46,9 @@ func (r *Registry) AddMessanger(givenAddress string, actualAddress string) (int3
 	// Add new messanger to Registry
 	r.messangers[newID] = givenAddress
 
-	// Return RegistrationResponse
-	return newID, "Registration successful.", nil
+	// Return RegistrationResponse -- include a message indicating the number of entries currently in its registry
+	response := fmt.Sprintf("Registration successful. The number of messaging nodes currently constituting the overlay is %d", len(r.messangers))
+	return newID, response, nil
 }
 
 // Deregistration: Remove messanger from Registry
@@ -57,11 +58,10 @@ func (r *Registry) RemoveMessanger(key int32, givenAddress string) (string, erro
 
 	// Guard Clause: Check if node exists in registry, and if given address matches
 	if _, exists := r.messangers[key]; !exists {
-		if r.messangers[key] != givenAddress {
-			return "Address does not match key.", fmt.Errorf("Address Mismatch")
-		}
-	} else {
 		return "Key does not exist in Registry.", fmt.Errorf("Invalid Key")
+	}
+	if r.messangers[key] != givenAddress {
+		return "Address does not match key.", fmt.Errorf("Address Mismatch")
 	}
 
 	// Remove messanger key
@@ -70,8 +70,56 @@ func (r *Registry) RemoveMessanger(key int32, givenAddress string) (string, erro
 	return "Deregistration successful.", nil
 }
 
+// Sends message back to messanger node for registration
+func HandleRegistration(conn net.Conn, id int32, info string) error {
+	// Initialise a registration response request
+	registration := &minichord.RegistrationResponse{
+		Result: id,
+		Info:   info,
+	}
+
+	// Create Minichord, where message is assignable to MiniChord_RegistrationResponse type
+	registrationResponse := &minichord.MiniChord{
+		Message: &minichord.MiniChord_RegistrationResponse{
+			RegistrationResponse: registration,
+		},
+	}
+
+	// Send minichord to messager using SendMiniChordMessage
+	err := minichord.SendMiniChordMessage(conn, registrationResponse)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Sends message back to messanger node for deregistration
+func HandleDeregistration(conn net.Conn, id int32, info string) error {
+	// Initialise a deregistration response request
+	deregistration := &minichord.DeregistrationResponse{
+		Result: id,
+		Info:   info,
+	}
+
+	// Create Minichord, where message is assignable to MiniChord_DeregistrationResponse type
+	deregistrationResponse := &minichord.MiniChord{
+		Message: &minichord.MiniChord_DeregistrationResponse{
+			DeregistrationResponse: deregistration,
+		},
+	}
+
+	// Send minichord to messager using SendMiniChordMessage
+	err := minichord.SendMiniChordMessage(conn, deregistrationResponse)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Essentially manages one messenger node over its life cycle, to look for communication attempts
-func handleIncomingMessage(conn net.Conn, r *Registry) {
+func HandleIncomingMessage(conn net.Conn, r *Registry) {
 	defer conn.Close()
 
 	// Check for all message types -- case switch
@@ -91,27 +139,24 @@ func handleIncomingMessage(conn net.Conn, r *Registry) {
 				fmt.Println("Address Mismatch")
 			}
 
-			id, info, err := r.AddMessanger(registerReq.Address, actualAddress)
+			id, info, _ := r.AddMessanger(registerReq.Address, actualAddress)
+
+			err := HandleRegistration(conn, id, info)
 			if err != nil {
-				// TODO
+				// TODO: in the rare case that a messaging node fails just after it sends a registration request, the registry cannot communicate with it.
+				// In this case, the registry removes the entry of the messaging node from the data structure maintained at the registry.
+			}
+		} else if deregisterReq := message.GetDeregistration(); deregisterReq != nil {
+			actualAddress := conn.RemoteAddr().String()
+
+			// Guard Clause: mismatch of given and actual address
+			if actualAddress != deregisterReq.Address {
+				fmt.Println("Address Mismatch")
 			}
 
-			// Initialise a registration response request
-			registration := &minichord.RegistrationResponse{
-				Result: id,
-				Info:   info,
-			}
+			info, _ := r.RemoveMessanger(deregisterReq.Id, deregisterReq.Address)
 
-			// Create Minichord, where message is assignable to MiniChord_Registration type
-			registrationResponse := &minichord.MiniChord{
-				Message: &minichord.MiniChord_RegistrationResponse{
-					RegistrationResponse: registration,
-				},
-			}
-
-			// Send minichord to messager using SendMiniChordMessage
-			// not sure why doing err := here makes the code start yelling at me icl
-			minichord.SendMiniChordMessage(conn, registrationResponse)
+			HandleDeregistration(conn, deregisterReq.Id, info)
 		}
 	}
 }
@@ -158,7 +203,7 @@ func main() {
 		conn, _ := listener.Accept()
 
 		// Rationale: creating a goroutine allows us to continue listening for other messenger nodes while this one is connected
-		go handleIncomingMessage(conn, r)
+		go HandleIncomingMessage(conn, r)
 	}
 }
 

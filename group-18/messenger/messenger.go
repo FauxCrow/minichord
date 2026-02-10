@@ -8,6 +8,12 @@ import (
 	minichord "github.com/mkyas/minichord/packages"
 )
 
+// Node information storage
+type Node struct {
+	id      int32  // stores assigned id from registry
+	address string // stores address used in registry
+}
+
 // handles creation and sending of registration message using protobuf
 func RegisterSelf(conn net.Conn, address string) {
 	// Initialise a registration request
@@ -26,6 +32,28 @@ func RegisterSelf(conn net.Conn, address string) {
 	err := minichord.SendMiniChordMessage(conn, registration)
 	if err != nil {
 		fmt.Println("Failure registering node from: " + address)
+	}
+}
+
+// handles creation and sending of deregistration message using protobuf
+func DeregisterSelf(conn net.Conn, n *Node) {
+	// Initialise a deregistration request
+	deregisterReq := &minichord.Deregistration{
+		Id:      n.id,
+		Address: n.address,
+	}
+
+	// Create Minichord, where message is assignable to MiniChord_Deregistration type
+	deregistration := &minichord.MiniChord{
+		Message: &minichord.MiniChord_Deregistration{
+			Deregistration: deregisterReq,
+		},
+	}
+
+	// Send minichord to register using SendMiniChordMessage
+	err := minichord.SendMiniChordMessage(conn, deregistration)
+	if err != nil {
+		fmt.Println("Failure registering node from: " + n.address)
 	}
 }
 
@@ -49,6 +77,9 @@ func main() {
 	}
 	target := os.Args[1]
 
+	// Initialise the node
+	n := &Node{}
+
 	// Establish connection with registry
 	conn, err := net.Dial("tcp", target)
 	if err != nil {
@@ -61,15 +92,33 @@ func main() {
 	RegisterSelf(conn, conn.LocalAddr().String())
 
 	// Registeration - await confirmation that it has been registered
-	response, err := minichord.ReceiveMiniChordMessage(conn)
-	if err != nil {
-		fmt.Println("Error receiving response:", err)
+	regResponse, regErr := minichord.ReceiveMiniChordMessage(conn)
+	if regErr != nil {
+		fmt.Println("Error receiving response:", regErr)
 		return
 	}
 
-	// TEMP: check if connection works
-	if regResponse := response.GetRegistrationResponse(); regResponse != nil {
-		fmt.Printf("Registration Result ID: %d\n", regResponse.Result)
+	// Check if connection works
+	if response := regResponse.GetRegistrationResponse(); response != nil {
+		n.id = response.Result
+		n.address = conn.LocalAddr().String()
+
+		fmt.Printf("Registration of %d successful at %s", n.id, n.address)
+	}
+
+	// TEMP PLACEMENT: Deregistration - end contact with registry
+	DeregisterSelf(conn, n)
+
+	// Registeration - await confirmation that it has been deregistered
+	deregResponse, deregErr := minichord.ReceiveMiniChordMessage(conn)
+	if deregErr != nil {
+		fmt.Println("Error receiving response:", deregErr)
+		return
+	}
+
+	// Check if connection works
+	if response := deregResponse.GetRegistrationResponse(); response != nil {
+		fmt.Printf("Deregistration of %d successful at %s", n.id, n.address)
 	}
 
 	// TODO: Sending messages to other nodes
