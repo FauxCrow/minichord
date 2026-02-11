@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -43,7 +44,7 @@ func (r *Registry) List() {
 			host = address
 			port = "?"
 		}
-		fmt.Printf("%d | %s | %s", id, host, port)
+		fmt.Printf("%d | %s | %s\n", id, host, port)
 	}
 }
 
@@ -64,7 +65,7 @@ func (r *Registry) Route() {
 
 	// Print all rows
 	for id, peers := range r.fingerTables {
-		fmt.Printf("%d | %d", id, peers)
+		fmt.Printf("%d | %v\n", id, peers)
 	}
 }
 
@@ -233,26 +234,61 @@ func (r *Registry) SetupNR(nr int) error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
+	// to use later to recompute form id to addressid as recommended
+	addrID := make(map[int32]string, len(r.messangers))
+	for id, addr := range r.messangers {
+		addrID[id] = addr
+	}
+
 	// sort the ids of all nodes -- from random to ascending order
-	var sortedIDs []int // use int so we can use sort later
+	sortedIDs := make([]int, 0, len(r.messangers)) // use int so we can use sort later
 	for id := range r.messangers {
 		sortedIDs = append(sortedIDs, int(id))
 	}
 	sort.Ints(sortedIDs)
 
+	// debug
+	fmt.Println(sortedIDs)
+
+	// build overlay id list
+	overlayIDs := make([]int32, 0, len(sortedIDs))
+	for _, id := range sortedIDs{
+		overlayIDs = append(overlayIDs, int32(id))
+	}
+
+	// empty out fingertable in case if there is old data
+	r.fingerTables = make(map[int32][]int32, len(sortedIDs))
+
 	// for every node, we calculate the finger table using formula: n >= p + 2^(i-1)
 	for _, nodeID := range sortedIDs {
+		p := int32(nodeID)
 		temp := make([]int32, nr)
 
 		// apply formula to every slot in the finger table (corresponds to NR)
 		for i := 0; i < nr; i++ {
 			calculatedValue := (nodeID + int(math.Pow(2, float64(i)))) % 1024
 			temp[i] = int32(Successor(calculatedValue, sortedIDs))
+
+			// check if the caluclated value is self-referenced
+			if (p == temp[i]){
+				idxshift := 0
+
+				// find the position of p
+				for idxshift < len(sortedIDs) && int32(sortedIDs[idxshift]) != p {
+					idxshift++
+				}
+				// next value w wrap around
+				if idxshift < len(sortedIDs){
+					temp[i] = int32(sortedIDs[(idxshift+1)%len(sortedIDs)])
+				}
 		}
 
 		// add the temp table to the registry at current nodeID
-		r.fingerTables[int32(nodeID)] = temp
+		r.fingerTables[p] = temp
 	}
+
+	// i think the mutex can be unlocked here alr? since nothing is shared here atp, or convert
+	// below to another helper fn? idk
 
 	// I know this would be so much faster using goroutines but i just want this to work first...
 	// install the finger table at every node -- use message NodeRegistry
@@ -273,8 +309,11 @@ func (r *Registry) SetupNR(nr int) error {
 		nodeRegistry := &minichord.NodeRegistry{
 			NR:    uint32(nr),
 			Peers: tempPeers,
-			NoIds: 8, // Not entirely sure if this is number of peers or number of unique peers?
-			Ids:   tempIds,
+			//NoIds: 8, // Not entirely sure if this is number of peers or number of unique peers?
+			//Ids:   tempIds,
+			// should be sending wrt to the overlayID values right
+			NoIds: uint32(len(overlayIDs)),
+			Ids: overlayIDs,
 		}
 
 		// Create Minichord, where message is assignable to MiniChord_DeregistrationResponse type
@@ -302,6 +341,8 @@ func (r *Registry) SetupNR(nr int) error {
 // TODO: Helper: The start command makes the registry send the message TaskInitiate message to all nodes registered in the overlay. A command of start 50 results in each messaging node sending 50 packets to randomly chosen nodes.
 func (r *Registry) Start(n int) {
 	//sending a message InitiateTask control message to all nodes
+	//debug
+	fmt.Printf("start input value %d\n", n)
 }
 
 // Main program ------------------------------------------------------------------------------------
@@ -343,16 +384,30 @@ func main() {
 			break
 		}
 		cmd = strings.TrimSpace(cmd)
-		switch cmd {
+
+		// take multi input
+		tok := strings.Fields(cmd)
+		switch tok[0] {
 		case "list":
 			r.List()
 		case "setup":
 			fmt.Println("setup")
-			//r.SetupNR(8)
+			nr, nrErr := strconv.Atoi(tok[1])
+			if nrErr != nil {
+				fmt.Println(nrErr)
+			}
+			r.SetupNR(nr)
+		case "route":
+			r.Route()
 		case "start":
 			fmt.Println("start")
+			n, nErr := strconv.Atoi(tok[1])
+			if nErr != nil {
+				fmt.Println(nErr)
+			}
+			r.Start(n)
 		default:
-			fmt.Printf("Command not understood: %s", cmd)
+			fmt.Printf("Command not understood: %s\n", cmd)
 		}
 	}
 }
