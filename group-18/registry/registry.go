@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"math"
 	"math/rand"
 	"net"
 	"os"
@@ -21,8 +20,8 @@ type Registry struct {
 	mutex        sync.RWMutex      // mutex: ensures safe access to Registry (Reference: https://gobyexample.com/mutexes)
 }
 
-// Helper: List all currently registered messaging nodes’ hostname, port number, and node ID.
-func (r *Registry) List() {
+// List all currently registered messaging nodes’ hostname, port number, and node ID.
+func (r *Registry) list() {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
@@ -43,12 +42,12 @@ func (r *Registry) List() {
 			host = address
 			port = "?"
 		}
-		fmt.Printf("%d | %s | %s", id, host, port)
+		fmt.Printf("%d | %s | %s\n", id, host, port)
 	}
 }
 
-// Helper: List the computed finger tables for each node in the overlay.
-func (r *Registry) Route() {
+// List the computed finger tables for each node in the overlay.
+func (r *Registry) route() {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
@@ -74,7 +73,6 @@ func (r *Registry) AddMessanger(givenAddress string, actualAddress string) (int3
 	defer r.mutex.Unlock()
 
 	// Guard Clause: duplicate address registration
-	// Note: O(n) implementation, can try to see if can reduce this?
 	for _, addr := range r.messangers {
 		if addr == givenAddress {
 			return -1, "Node has already been registered.", fmt.Errorf("Duplicate Registration")
@@ -112,9 +110,9 @@ func (r *Registry) RemoveMessanger(key int32, givenAddress string) (string, erro
 	if _, exists := r.messangers[key]; !exists {
 		return "Key does not exist in Registry.", fmt.Errorf("Invalid Key")
 	}
-	if r.messangers[key] != givenAddress {
-		return "Address does not match key.", fmt.Errorf("Address Mismatch")
-	}
+	// if r.messangers[key] != givenAddress {
+	// 	return "Address does not match key.", fmt.Errorf("Address Mismatch")
+	// }
 
 	// Remove messanger key
 	delete(r.messangers, key)
@@ -172,14 +170,12 @@ func HandleDeregistration(conn net.Conn, id int32, info string) error {
 
 // Essentially manages one messenger node over its life cycle, to look for communication attempts
 func HandleIncomingMessage(conn net.Conn, r *Registry) {
-	defer conn.Close()
-
 	// Check for all message types -- case switch
 	for {
 		message, err := minichord.ReceiveMiniChordMessage(conn)
 		if err != nil {
 			fmt.Println("Messenger disconnected")
-			return // need to kill the goroutine...
+			return
 		}
 
 		// Case 1: Registration
@@ -187,9 +183,9 @@ func HandleIncomingMessage(conn net.Conn, r *Registry) {
 			actualAddress := conn.RemoteAddr().String()
 
 			// Guard Clause: mismatch of given and actual address
-			if actualAddress != registerReq.Address {
-				fmt.Println("Address Mismatch")
-			}
+			// if actualAddress != registerReq.Address {
+			// 	fmt.Println("Address Mismatch")
+			// }
 
 			id, info, _ := r.AddMessanger(registerReq.Address, actualAddress)
 
@@ -200,12 +196,12 @@ func HandleIncomingMessage(conn net.Conn, r *Registry) {
 			}
 			// Case 2: Deregistration
 		} else if deregisterReq := message.GetDeregistration(); deregisterReq != nil {
-			actualAddress := conn.RemoteAddr().String()
-
+			//actualAddress := conn.RemoteAddr().String()
+			//
 			// Guard Clause: mismatch of given and actual address
-			if actualAddress != deregisterReq.Address {
-				fmt.Println("Address Mismatch")
-			}
+			// if actualAddress != deregisterReq.Address {
+			// 	fmt.Println("Address Mismatch")
+			// }
 
 			info, _ := r.RemoveMessanger(deregisterReq.Id, deregisterReq.Address)
 
@@ -214,8 +210,8 @@ func HandleIncomingMessage(conn net.Conn, r *Registry) {
 	}
 }
 
-// Helper: Find the first node in the sorted registered IDs that is >= to a provided target value
-func Successor(target int, sortedIDs []int) int {
+// Find the first node in the sorted registered IDs that is >= to a provided target value
+func successor(target int, sortedIDs []int) int {
 	// loop through sortedIDs
 	for _, id := range sortedIDs {
 		if id >= target {
@@ -227,8 +223,8 @@ func Successor(target int, sortedIDs []int) int {
 	return sortedIDs[0]
 }
 
-// Helper: Setup the overlay with 𝑁𝑅 entries in the finger table.
-func (r *Registry) SetupNR(nr int) error {
+// Setup the overlay with 𝑁𝑅 entries in the finger table.
+func (r *Registry) setupNR(nr int) error {
 	// Ensure no one is added or removed from the registry while we calculate the finger table
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
@@ -246,15 +242,14 @@ func (r *Registry) SetupNR(nr int) error {
 
 		// apply formula to every slot in the finger table (corresponds to NR)
 		for i := 0; i < nr; i++ {
-			calculatedValue := (nodeID + int(math.Pow(2, float64(i)))) % 1024
-			temp[i] = int32(Successor(calculatedValue, sortedIDs))
+			calculatedValue := (nodeID + (1 << i)) % 1024
+			temp[i] = int32(successor(calculatedValue, sortedIDs))
 		}
 
 		// add the temp table to the registry at current nodeID
 		r.fingerTables[int32(nodeID)] = temp
 	}
 
-	// I know this would be so much faster using goroutines but i just want this to work first...
 	// install the finger table at every node -- use message NodeRegistry
 	for id, table := range r.fingerTables {
 		tempPeers := []*minichord.Deregistration{}
@@ -273,7 +268,7 @@ func (r *Registry) SetupNR(nr int) error {
 		nodeRegistry := &minichord.NodeRegistry{
 			NR:    uint32(nr),
 			Peers: tempPeers,
-			NoIds: 8, // Not entirely sure if this is number of peers or number of unique peers?
+			NoIds: 10,
 			Ids:   tempIds,
 		}
 
@@ -284,7 +279,18 @@ func (r *Registry) SetupNR(nr int) error {
 			},
 		}
 
-		conn, _ := net.Dial("tcp", r.messangers[int32(id)])
+		// Temp: Check to see if address was saved correctly
+		addr, exists := r.messangers[int32(id)]
+		if !exists || addr == "" {
+			fmt.Printf("Error: No address found for Node ID %d\n", id)
+			continue
+		}
+
+		conn, dialErr := net.Dial("tcp", addr)
+		if dialErr != nil {
+			fmt.Printf("Could not connect to node %d at %s\n", id, r.messangers[int32(id)])
+			continue
+		}
 		defer conn.Close()
 
 		// Send minichord to messager using SendMiniChordMessage
@@ -293,9 +299,20 @@ func (r *Registry) SetupNR(nr int) error {
 			return err
 		}
 
+		// Wait for the response here -- means each node will report to the registry on their status before moving to the next
+		// Rationale: if one node fails, we can immedietely exit instead of waiting for all of them to complete checking their neighbours
+		response, err := minichord.ReceiveMiniChordMessage(conn)
+		if err != nil {
+			fmt.Printf("Node %d failed to confirm setup\n", id)
+			return err
+		} else if result := response.GetNodeRegistryResponse(); result != nil {
+			fmt.Printf("Confirmation from node %d: %d %s\n", id, result.Result, result.Info)
+		}
+
 		conn.Close()
 	}
 
+	fmt.Printf("The registry is now ready to initiate tasks.")
 	return nil
 }
 
@@ -328,8 +345,11 @@ func main() {
 		for {
 			conn, _ := listener.Accept()
 
-			// Rationale: creating a goroutine allows us to continue listening for other messenger nodes while this one is connected
-			go HandleIncomingMessage(conn, r)
+			// Rationale: creating a goroutine allows us to continue listening for other messenger nodes while this one is connected, instead of waiting
+			go func(c net.Conn) {
+				defer c.Close()
+				HandleIncomingMessage(c, r)
+			}(conn)
 		}
 	}()
 
@@ -345,10 +365,12 @@ func main() {
 		cmd = strings.TrimSpace(cmd)
 		switch cmd {
 		case "list":
-			r.List()
+			r.list()
 		case "setup":
 			fmt.Println("setup")
-			//r.SetupNR(8)
+			r.setupNR(10)
+		case "route":
+			r.route()
 		case "start":
 			fmt.Println("start")
 		default:

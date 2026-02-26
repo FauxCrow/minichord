@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -61,13 +62,11 @@ func DeregisterSelf(conn net.Conn, n *Node) {
 }
 
 func HandleIncomingMessage(conn net.Conn, n *Node) {
-	defer conn.Close()
-
 	for {
 		message, err := minichord.ReceiveMiniChordMessage(conn)
 		if err != nil {
 			fmt.Println("Messenger disconnected")
-			return // need to kill the goroutine...
+			return
 		}
 
 		// Case 1: Setup - Node Overlay
@@ -75,23 +74,46 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 			fmt.Printf("\nReceived updated finger table with %d entries.\n", nodeRegistry.NR)
 			n.fingerTable = nodeRegistry.Peers
 
-			// TODO:  initiate connections to the nodes that comprise its finger table
+			// Initiate connections to the nodes that comprise its finger table, and track how many succeed
+			success := 0
+			for _, peer := range n.fingerTable {
+				pConn, err := net.Dial("tcp", peer.Address)
+				if err != nil {
+					fmt.Printf("Failed to connect to peer %d at %s: %v\n", peer.Id, peer.Address, err)
+					continue
+				}
+				pConn.Close()
+				success++
+			}
 
 			// Initialise a node registry response
-			// nodeRegistryResponse := &minichord.NodeRegistryResponse{
-			// 	Result: ,
-			// 	Info "Recieved",
-			// }
+			nodeRegistryReq := &minichord.NodeRegistryResponse{
+				Result: int32(success),
+				Info:   "Recieved",
+			}
+
+			// Create Minichord, where message is assignable to MiniChord_Deregistration type
+			nodeRegistryResponse := &minichord.MiniChord{
+				Message: &minichord.MiniChord_NodeRegistryResponse{
+					NodeRegistryResponse: nodeRegistryReq,
+				},
+			}
+
+			// Send minichord to register using SendMiniChordMessage
+			err := minichord.SendMiniChordMessage(conn, nodeRegistryResponse)
+			if err != nil {
+				fmt.Println("Failure informing on node registry setup from: " + n.address)
+			}
 		}
 	}
 }
 
-// TODO: Helper: print information to the console about the number of messages sent, received, and relayed, along with the sums for the messages sent from and received at the node.
+// TODO: print information to the console about the number of messages sent, received, and relayed, along with the sums for the messages sent from and received at the node.
 func Print() {
 
 }
 
-// TODO: Helper: allows a messaging node to exit the overlay. The messaging node should first send a deregistration message (see Section 2.2) to the registry and await a response before exiting and terminating the process.
+// TODO: allows a messaging node to exit the overlay. The messaging node should first send a deregistration message (see Section 2.2) to the registry and await a response before exiting and terminating the process.
 func Exit() {
 	// Temp placement -- will clean up later!!
 	// DeregisterSelf(conn, n)
@@ -122,6 +144,13 @@ func main() {
 	// Initialise the node
 	n := &Node{}
 
+	// Setup active listener to registry -- awaiting commands and executions (Reference: minichord.pdf)
+	listener, _ := net.Listen("tcp", ":0")
+
+	// Split the port from the host before we save that information in the registry
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+	fullAddress := "127.0.0.1:" + port
+
 	// Establish connection with registry
 	conn, err := net.Dial("tcp", target)
 	if err != nil {
@@ -131,7 +160,7 @@ func main() {
 	defer conn.Close()
 
 	// Registeration - initiate contact with registry
-	RegisterSelf(conn, conn.LocalAddr().String())
+	RegisterSelf(conn, fullAddress)
 
 	// Registeration - await confirmation that it has been registered
 	regResponse, regErr := minichord.ReceiveMiniChordMessage(conn)
@@ -143,20 +172,18 @@ func main() {
 	// Check if connection works
 	if response := regResponse.GetRegistrationResponse(); response != nil {
 		n.id = response.Result
-		n.address = conn.LocalAddr().String()
-
-		fmt.Printf("Registration of %d successful at %s", n.id, n.address)
+		fmt.Printf("Registration of %d successful at %s", n.id, fullAddress)
 	}
-
-	// Setup active listener to registry -- awaiting commands and executions (Reference: minichord.pdf)
-	listener, _ := net.Listen("tcp", ":"+target)
 
 	// listen for connections in separate goroutine -- so we can still look for user inputs while this runs
 	go func() {
 		for {
 			conn, _ := listener.Accept()
 
-			HandleIncomingMessage(conn, n)
+			go func(c net.Conn) {
+				defer c.Close()
+				HandleIncomingMessage(c, n)
+			}(conn)
 		}
 	}()
 
@@ -166,9 +193,13 @@ func main() {
 	for {
 		cmd, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Println(err)
+			if err == io.EOF {
+				select {}
+			}
+			fmt.Println("Reader error:", err)
 			break
 		}
+
 		cmd = strings.TrimSpace(cmd)
 		switch cmd {
 		case "exit":
