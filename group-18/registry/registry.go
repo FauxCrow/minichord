@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -18,6 +19,9 @@ type Registry struct {
 	messangers   map[int32]string  // key: random identifier (between 0–1023), value: given address
 	fingerTables map[int32][]int32 // key: node associated with finger table, value: list of IDs
 	mutex        sync.RWMutex      // mutex: ensures safe access to Registry (Reference: https://gobyexample.com/mutexes)
+
+	taskDone  map[int32]bool
+	summaries map[int32]*minichord.TrafficSummary
 }
 
 // List all currently registered messaging nodes’ hostname, port number, and node ID.
@@ -63,12 +67,12 @@ func (r *Registry) route() {
 
 	// Print all rows
 	for id, peers := range r.fingerTables {
-		fmt.Printf("%d | %d", id, peers)
+		fmt.Printf("%d | %v\n", id, peers)
 	}
 }
 
 // Registration: Adds new messanger to Registry
-func (r *Registry) AddMessanger(givenAddress string, actualAddress string) (int32, string, error) {
+func (r *Registry) AddMessanger(givenAddress string) (int32, string, error) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -109,6 +113,9 @@ func (r *Registry) RemoveMessanger(key int32, givenAddress string) (string, erro
 	// Guard Clause: Check if node exists in registry, and if given address matches
 	if _, exists := r.messangers[key]; !exists {
 		return "Key does not exist in Registry.", fmt.Errorf("Invalid Key")
+	}
+	if r.messangers[key] != givenAddress {
+		return "Address does not match key.", fmt.Errorf("mismatched address")
 	}
 
 	// Remove messanger key
@@ -165,6 +172,16 @@ func HandleDeregistration(conn net.Conn, id int32, info string) error {
 	return nil
 }
 
+// compare host only
+func checkSameHost(a string, b string) bool {
+	ha, _, errA := net.SplitHostPort(a)
+	hb, _, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return ha == hb
+}
+
 // Essentially manages one messenger node over its life cycle, to look for communication attempts
 func HandleIncomingMessage(conn net.Conn, r *Registry) {
 	// Check for all message types -- case switch
@@ -179,20 +196,49 @@ func HandleIncomingMessage(conn net.Conn, r *Registry) {
 		if registerReq := message.GetRegistration(); registerReq != nil {
 			actualAddress := conn.RemoteAddr().String()
 
-			id, info, _ := r.AddMessanger(registerReq.Address, actualAddress)
+			if !checkSameHost(actualAddress, registerReq.Address) {
+				HandleRegistration(conn, -1, "Registration host mismatch")
+				return
+			}
 
-			err := HandleRegistration(conn, id, info)
-			if err != nil {
+			id, info, addErr := r.AddMessanger(registerReq.Address)
+			if addErr != nil {
+				HandleRegistration(conn, -1, info)
+				return
+			}
+
+			if err := HandleRegistration(conn, id, info); err != nil {
 				// In the rare case that a messaging node fails just after it sends a registration request, the registry cannot communicate with it.
 				// In this case, the registry removes the entry of the messaging node from the data structure maintained at the registry.
 				fmt.Printf("Failed to send RegistrationResponse to %s: %v. Cleaning up...\n", registerReq.Address, err)
 				r.RemoveMessanger(id, registerReq.Address)
 			}
+
 			// Case 2: Deregistration
 		} else if deregisterReq := message.GetDeregistration(); deregisterReq != nil {
-			info, _ := r.RemoveMessanger(deregisterReq.Id, deregisterReq.Address)
+			actualAddress := conn.RemoteAddr().String()
+
+			if !checkSameHost(actualAddress, deregisterReq.Address) {
+				HandleDeregistration(conn, -1, "De-registration host mismatch")
+				return
+			}
+
+			info, remErr := r.RemoveMessanger(deregisterReq.Id, deregisterReq.Address)
+			if remErr != nil {
+				HandleDeregistration(conn, -1, info)
+				return
+			}
 			HandleDeregistration(conn, deregisterReq.Id, info)
+
+			// task finished
+		} else if tf := message.GetTaskFinished(); tf != nil {
+			r.completedTask(tf)
+
+			// traffic summary
+		} else if ts := message.GetReportTrafficSummary(); ts != nil {
+			r.handleTrafficSummary(ts)
 		}
+
 	}
 }
 
@@ -211,6 +257,17 @@ func successor(target int, sortedIDs []int) int {
 
 // Setup the overlay with 𝑁𝑅 entries in the finger table.
 func (r *Registry) setupNR(nr int) error {
+	// guard input
+	if nr <= 0 {
+		return fmt.Errorf("nr must be > 0")
+	}
+	if len(r.messangers) == 0 {
+		return fmt.Errorf("no registered nodes")
+	}
+	if nr > len(r.messangers)-1 {
+		return fmt.Errorf("nr cannot be larger than number of registered nodes")
+	}
+
 	// Ensure no one is added or removed from the registry while we calculate the finger table
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
@@ -222,14 +279,32 @@ func (r *Registry) setupNR(nr int) error {
 	}
 	sort.Ints(sortedIDs)
 
+	// incase there are older entries
+	r.fingerTables = make(map[int32][]int32, len(sortedIDs))
+
+	// build the list of overlayIDs
+	overlayIDs := make([]int32, 0, len(sortedIDs))
+	for _, id := range sortedIDs {
+		overlayIDs = append(overlayIDs, int32(id))
+	}
+
 	// for every node, we calculate the finger table using formula: n >= p + 2^(i-1)
 	for _, nodeID := range sortedIDs {
 		temp := make([]int32, nr)
 
 		// apply formula to every slot in the finger table (corresponds to NR)
+		// should not connect to itself, skip itself
 		for i := 0; i < nr; i++ {
 			calculatedValue := (nodeID + (1 << i)) % 1024
-			temp[i] = int32(successor(calculatedValue, sortedIDs))
+			next := int32(successor(calculatedValue, sortedIDs))
+			if next == int32(nodeID) {
+				pos := 0
+				for pos < len(sortedIDs) && sortedIDs[pos] != nodeID {
+					pos++
+				}
+				next = int32(sortedIDs[(pos+1)%len(sortedIDs)])
+			}
+			temp[i] = next
 		}
 
 		// add the temp table to the registry at current nodeID
@@ -239,7 +314,6 @@ func (r *Registry) setupNR(nr int) error {
 	// install the finger table at every node -- use message NodeRegistry
 	for id, table := range r.fingerTables {
 		tempPeers := []*minichord.Deregistration{}
-		tempIds := []int32{}
 
 		for _, peer := range table {
 			peers := &minichord.Deregistration{
@@ -247,15 +321,14 @@ func (r *Registry) setupNR(nr int) error {
 				Address: r.messangers[peer],
 			}
 			tempPeers = append(tempPeers, peers)
-			tempIds = append(tempIds, peer)
 		}
 
 		// Initialise a registration response request
 		nodeRegistry := &minichord.NodeRegistry{
 			NR:    uint32(nr),
 			Peers: tempPeers,
-			NoIds: 10,
-			Ids:   tempIds,
+			NoIds: uint32(len(overlayIDs)),
+			Ids:   overlayIDs,
 		}
 
 		// Create Minichord, where message is assignable to MiniChord_DeregistrationResponse type
@@ -277,34 +350,191 @@ func (r *Registry) setupNR(nr int) error {
 			fmt.Printf("Could not connect to node %d at %s\n", id, r.messangers[int32(id)])
 			continue
 		}
-		defer conn.Close()
 
 		// Send minichord to messager using SendMiniChordMessage
 		err := minichord.SendMiniChordMessage(conn, nodeRegistryMessage)
 		if err != nil {
+			conn.Close()
 			return err
 		}
 
 		// Wait for the response here -- means each node will report to the registry on their status before moving to the next
 		// Rationale: if one node fails, we can immedietely exit instead of waiting for all of them to complete checking their neighbours
 		response, err := minichord.ReceiveMiniChordMessage(conn)
+		conn.Close()
 		if err != nil {
 			fmt.Printf("Node %d failed to confirm setup\n", id)
 			return err
 		} else if result := response.GetNodeRegistryResponse(); result != nil {
 			fmt.Printf("Confirmation from node %d: %d %s\n", id, result.Result, result.Info)
+
+			if result.Result < 0 {
+				return fmt.Errorf("node %d failed overlay setup: %s", id, result.Info)
+			}
+		} else {
+			return fmt.Errorf("node %d did not send NodeRegistryResponse", id)
 		}
 
-		conn.Close()
 	}
 
-	fmt.Printf("The registry is now ready to initiate tasks.")
+	fmt.Printf("The registry is now ready to initiate tasks.\n")
 	return nil
 }
 
 // TODO: Helper: The start command makes the registry send the message TaskInitiate message to all nodes registered in the overlay. A command of start 50 results in each messaging node sending 50 packets to randomly chosen nodes.
 func (r *Registry) Start(n int) {
 	//sending a message InitiateTask control message to all nodes
+	if n <= 0 {
+		fmt.Println("start count must be > 0")
+		return
+	}
+
+	// san check states
+	r.mutex.Lock()
+	r.taskDone = make(map[int32]bool)
+	r.summaries = make(map[int32]*minichord.TrafficSummary)
+	r.mutex.Unlock()
+
+	r.mutex.RLock()
+
+	addrByID := make(map[int32]string, len(r.messangers))
+	for id, addr := range r.messangers {
+		addrByID[id] = addr
+	}
+
+	r.mutex.RUnlock()
+
+	for id, addr := range addrByID {
+		task := &minichord.InitiateTask{
+			Packets: uint32(n),
+		}
+
+		msg := &minichord.MiniChord{
+			Message: &minichord.MiniChord_InitiateTask{
+				InitiateTask: task,
+			},
+		}
+
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			fmt.Printf("start | dial error for node %d at %s: %v\n", id, addr, err)
+			continue
+		}
+
+		err = minichord.SendMiniChordMessage(conn, msg)
+		conn.Close()
+		if err != nil {
+			fmt.Printf("start | send error for node %d at %s: %v\n", id, addr, err)
+		}
+	}
+}
+
+func (r *Registry) completedTask(tf *minichord.TaskFinished) {
+	r.mutex.Lock()
+	r.taskDone[tf.Id] = true
+
+	done := len(r.taskDone)
+	total := len(r.messangers)
+	r.mutex.Unlock()
+
+	fmt.Printf("Task completed from node %d (%d/%d)\n", tf.Id, done, total)
+
+	if done == total && total > 0 {
+		r.requestTrafficSummaries()
+	}
+}
+
+func (r *Registry) requestTrafficSummaries() {
+	r.mutex.RLock()
+	addrByID := make(map[int32]string, len(r.messangers))
+	for id, addr := range r.messangers {
+		addrByID[id] = addr
+	}
+
+	r.mutex.RUnlock()
+
+	for id, addr := range addrByID {
+		msg := &minichord.MiniChord{
+			Message: &minichord.MiniChord_RequestTrafficSummary{
+				RequestTrafficSummary: &minichord.RequestTrafficSummary{},
+			},
+		}
+
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			fmt.Printf("summary | dial error for node %d at %s: %v\n", id, addr, err)
+			continue
+		}
+
+		err = minichord.SendMiniChordMessage(conn, msg)
+		conn.Close()
+		if err != nil {
+			fmt.Printf("summary | send error for node %d at %s: %v\n", id, addr, err)
+		}
+	}
+}
+
+func (r *Registry) handleTrafficSummary(ts *minichord.TrafficSummary) {
+	r.mutex.Lock()
+	r.summaries[ts.Id] = ts
+
+	count := len(r.summaries)
+	total := len(r.messangers)
+	r.mutex.Unlock()
+
+	fmt.Printf("Traffic summary from node %d (%d/%d)\n", ts.Id, count, total)
+
+	if count == total && total > 0 {
+		r.outputTrafficSummaries()
+	}
+}
+
+func (r *Registry) outputTrafficSummaries() {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	fmt.Println("Node,Sent,Received,Relayed,TotalSent,TotalReceived")
+
+	var totalSent uint32
+	var totalRecv uint32
+	var totalRelay uint32
+	var totalSumSent int64
+	var totalSumRecv int64
+
+	for id, ts := range r.summaries {
+		fmt.Printf("%d,%d,%d,%d,%d,%d\n",
+			id,
+			ts.Sent,
+			ts.Received,
+			ts.Relayed,
+			ts.TotalSent,
+			ts.TotalReceived,
+		)
+
+		totalSent += ts.Sent
+		totalRecv += ts.Received
+		totalRelay += ts.Relayed
+		totalSumSent += ts.TotalSent
+		totalSumRecv += ts.TotalReceived
+
+	}
+
+	fmt.Printf("Sum,%d,%d,%d,%d,%d\n",
+		totalSent,
+		totalRecv,
+		totalRelay,
+		totalSumSent,
+		totalSumRecv,
+	)
+
+	if totalSent != totalRecv {
+		fmt.Printf("total sent (%d) != total received (%d)\n", totalSent, totalRecv)
+	}
+
+	if totalSumSent != totalSumRecv {
+		fmt.Printf("total sum sent (%d) != total sum received (%d)\n", totalSumSent, totalSumRecv)
+	}
+
 }
 
 // Main program ------------------------------------------------------------------------------------
@@ -321,15 +551,25 @@ func main() {
 	r := &Registry{
 		messangers:   make(map[int32]string),
 		fingerTables: make(map[int32][]int32),
+		taskDone:     make(map[int32]bool),
+		summaries:    make(map[int32]*minichord.TrafficSummary),
 	}
 
 	// Setup connection (Reference: minichord.pdf)
-	listener, _ := net.Listen("tcp", ":"+port)
+	listener, listErr := net.Listen("tcp", ":"+port)
+	if listErr != nil {
+		fmt.Println("listen error:", listErr)
+		return
+	}
 
 	// listen for connections in separate goroutine -- so we can still look for user inputs while this runs
 	go func() {
 		for {
-			conn, _ := listener.Accept()
+			conn, err := listener.Accept()
+			if err != nil {
+				fmt.Println("accept error:", err)
+				continue
+			}
 
 			// Rationale: creating a goroutine allows us to continue listening for other messenger nodes while this one is connected, instead of waiting
 			go func(c net.Conn) {
@@ -349,18 +589,51 @@ func main() {
 			break
 		}
 		cmd = strings.TrimSpace(cmd)
-		switch cmd {
+
+		// guard input
+		tok := strings.Fields(cmd)
+		if len(tok) == 0 {
+			continue
+		}
+
+		switch tok[0] {
+
 		case "list":
 			r.list()
+
 		case "setup":
-			fmt.Println("setup")
-			r.setupNR(10)
+			if len(tok) < 2 {
+				fmt.Println("usage: setup [nr]")
+				continue
+			}
+			nr, err := strconv.Atoi(tok[1])
+			if err != nil {
+				fmt.Println("invalid nr:", err)
+				continue
+			}
+
+			if err := r.setupNR(nr); err != nil {
+				fmt.Println("setup error:", err)
+			}
+
 		case "route":
 			r.route()
+
 		case "start":
-			fmt.Println("start")
+			if len(tok) < 2 {
+				fmt.Println("usage: start [packets]")
+				continue
+			}
+			n, err := strconv.Atoi(tok[1])
+			if err != nil {
+				fmt.Println("invalid start count:", err)
+				continue
+			}
+
+			r.Start(n)
+
 		default:
-			fmt.Printf("Command not understood: %s", cmd)
+			fmt.Printf("Command not understood: %s\n", cmd)
 		}
 	}
 }
