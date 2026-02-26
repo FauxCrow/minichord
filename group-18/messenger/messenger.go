@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -17,6 +18,13 @@ type Node struct {
 	address         string                      // stores address used by registry
 	registryAddress string                      // stores the registry's adress
 	fingerTable     []*minichord.Deregistration // list of IDs
+	allIDs          []int32
+
+	sendTracker    uint32
+	receiveTracker uint32
+	relayTracker   uint32
+	sendSummation  int64
+	recvSummation  int64
 }
 
 // handles creation and sending of registration message using protobuf
@@ -62,6 +70,17 @@ func DeregisterSelf(conn net.Conn, n *Node) {
 	}
 }
 
+// san check
+func (n *Node) runTest(packets int) {
+	for i := 0; i < packets; i++ {
+		payload := rand.Int31()
+		n.sendTracker++
+		n.sendSummation += int64(payload)
+	}
+
+	n.sendTaskFinished()
+}
+
 func HandleIncomingMessage(conn net.Conn, n *Node) {
 	for {
 		message, err := minichord.ReceiveMiniChordMessage(conn)
@@ -74,6 +93,7 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 		if nodeRegistry := message.GetNodeRegistry(); nodeRegistry != nil {
 			fmt.Printf("\nReceived updated finger table with %d entries.\n", nodeRegistry.NR)
 			n.fingerTable = nodeRegistry.Peers
+			n.allIDs = nodeRegistry.Ids
 
 			// Initiate connections to the nodes that comprise its finger table, and track how many succeed
 			success := 0
@@ -88,9 +108,17 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 			}
 
 			// Initialise a node registry response
+			result := int32(0)
+			info := "Received"
+
+			if success != len(n.fingerTable) {
+				result = -1
+				info = "Unable to connect to all finger table peers"
+			}
+
 			nodeRegistryReq := &minichord.NodeRegistryResponse{
-				Result: int32(success),
-				Info:   "Recieved",
+				Result: result,
+				Info:   info,
 			}
 
 			// Create Minichord, where message is assignable to MiniChord_Deregistration type
@@ -105,13 +133,84 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 			if err != nil {
 				fmt.Println("Failure informing on node registry setup from: " + n.address)
 			}
+		} else if message.GetReportTrafficSummary() != nil {
+			n.sendTrafficSummary()
+		} else if task := message.GetInitiateTask(); task != nil {
+			fmt.Printf("Received InitiateTask: %d packets \n", task.Packets)
+			go n.runTest(int(task.Packets))
 		}
 	}
 }
 
 // TODO: print information to the console about the number of messages sent, received, and relayed, along with the sums for the messages sent from and received at the node.
-func Print() {
+func Print(n *Node) {
+	fmt.Printf("Node %d\n", n.id)
+	fmt.Printf("Sent: %d\n", n.sendTracker)
+	fmt.Printf("Received: %d\n", n.receiveTracker)
+	fmt.Printf("Relayed: %d\n", n.relayTracker)
+	fmt.Printf("Sum Sent: %d\n", n.sendSummation)
+	fmt.Printf("Sum Received: %d\n", n.recvSummation)
+}
 
+// helpers after node finishes sending assigned packets, to send data to registry
+func (n *Node) sendTaskFinished() error {
+	conn, err := net.Dial("tcp", n.registryAddress)
+	if err != nil {
+		return err
+	}
+
+	defer conn.Close()
+
+	tf := &minichord.TaskFinished{
+		Id:      n.id,
+		Address: n.address,
+	}
+
+	msg := &minichord.MiniChord{
+		Message: &minichord.MiniChord_TaskFinished{
+			TaskFinished: tf,
+		},
+	}
+
+	return minichord.SendMiniChordMessage(conn, msg)
+}
+
+func (n *Node) sendTrafficSummary() error {
+	conn, err := net.Dial("tcp", n.registryAddress)
+	if err != nil {
+		return err
+	}
+
+	defer conn.Close()
+
+	ts := &minichord.TrafficSummary{
+		Id:            n.id,
+		Sent:          n.sendTracker,
+		Received:      n.receiveTracker,
+		Relayed:       n.relayTracker,
+		TotalSent:     n.sendSummation,
+		TotalReceived: n.recvSummation,
+	}
+
+	msg := &minichord.MiniChord{
+		Message: &minichord.MiniChord_ReportTrafficSummary{
+			ReportTrafficSummary: ts,
+		},
+	}
+
+	err = minichord.SendMiniChordMessage(conn, msg)
+	if err != nil {
+		return err
+	}
+
+	// reset counters after sending
+	n.sendTracker = 0
+	n.receiveTracker = 0
+	n.relayTracker = 0
+	n.sendSummation = 0
+	n.recvSummation = 0
+
+	return nil
 }
 
 // TODO: allows a messaging node to exit the overlay. The messaging node should first send a deregistration message (see Section 2.2) to the registry and await a response before exiting and terminating the process.
@@ -154,10 +253,15 @@ func main() {
 	n.registryAddress = target
 
 	// Setup active listener to registry -- awaiting commands and executions (Reference: minichord.pdf)
-	listener, _ := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		fmt.Println("listen error:", err)
+		return
+	}
 
 	// Split the port from the host before we save that information in the registry
 	_, port, _ := net.SplitHostPort(listener.Addr().String())
+	// might need to modify this later
 	fullAddress := "127.0.0.1:" + port
 
 	// Establish connection with registry
@@ -188,7 +292,11 @@ func main() {
 	// listen for connections in separate goroutine -- so we can still look for user inputs while this runs
 	go func() {
 		for {
-			conn, _ := listener.Accept()
+			conn, err := listener.Accept()
+			if err != nil {
+				fmt.Println("listener accept error:", err)
+				continue
+			}
 
 			go func(c net.Conn) {
 				defer c.Close()
@@ -212,6 +320,8 @@ func main() {
 
 		cmd = strings.TrimSpace(cmd)
 		switch cmd {
+		case "print":
+			Print(n)
 		case "exit":
 			n.Exit()
 		default:
