@@ -13,9 +13,10 @@ import (
 
 // Node information storage
 type Node struct {
-	id          int32                       // stores assigned id from registry
-	address     string                      // stores address used in registry
-	fingerTable []*minichord.Deregistration // list of IDs
+	id              int32                       // stores assigned id from registry
+	address         string                      // stores address used by registry
+	registryAddress string                      // stores the registry's adress
+	fingerTable     []*minichord.Deregistration // list of IDs
 }
 
 // handles creation and sending of registration message using protobuf
@@ -57,7 +58,7 @@ func DeregisterSelf(conn net.Conn, n *Node) {
 	// Send minichord to register using SendMiniChordMessage
 	err := minichord.SendMiniChordMessage(conn, deregistration)
 	if err != nil {
-		fmt.Println("Failure registering node from: " + n.address)
+		fmt.Println("Failure deregistering node from: " + n.address)
 	}
 }
 
@@ -114,21 +115,28 @@ func Print() {
 }
 
 // TODO: allows a messaging node to exit the overlay. The messaging node should first send a deregistration message (see Section 2.2) to the registry and await a response before exiting and terminating the process.
-func Exit() {
-	// Temp placement -- will clean up later!!
-	// DeregisterSelf(conn, n)
+func (n *Node) Exit() error {
+	conn, err := net.Dial("tcp", n.registryAddress)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
-	// // Registeration - await confirmation that it has been deregistered
-	// deregResponse, deregErr := minichord.ReceiveMiniChordMessage(conn)
-	// if deregErr != nil {
-	// 	fmt.Println("Error receiving response:", deregErr)
-	// 	return
-	// }
+	DeregisterSelf(conn, n)
 
-	// // Check if connection works
-	// if response := deregResponse.GetRegistrationResponse(); response != nil {
-	// 	fmt.Printf("Deregistration of %d successful at %s", n.id, n.address)
-	// }
+	// Registeration - await confirmation that it has been deregistered
+	deregResponse, deregErr := minichord.ReceiveMiniChordMessage(conn)
+	if deregErr != nil {
+		fmt.Println("Error receiving response:", deregErr)
+		return deregErr
+	}
+
+	// Check if connection works
+	if response := deregResponse.GetDeregistrationResponse(); response != nil {
+		fmt.Printf("Deregistration of %d successful at %s", n.id, n.address)
+	}
+
+	return nil
 }
 
 // Main program ------------------------------------------------------------------------------------
@@ -143,6 +151,7 @@ func main() {
 
 	// Initialise the node
 	n := &Node{}
+	n.registryAddress = target
 
 	// Setup active listener to registry -- awaiting commands and executions (Reference: minichord.pdf)
 	listener, _ := net.Listen("tcp", ":0")
@@ -172,6 +181,7 @@ func main() {
 	// Check if connection works
 	if response := regResponse.GetRegistrationResponse(); response != nil {
 		n.id = response.Result
+		n.address = fullAddress
 		fmt.Printf("Registration of %d successful at %s", n.id, fullAddress)
 	}
 
@@ -203,7 +213,7 @@ func main() {
 		cmd = strings.TrimSpace(cmd)
 		switch cmd {
 		case "exit":
-			Exit()
+			n.Exit()
 		default:
 			fmt.Printf("Command not understood: %s", cmd)
 		}

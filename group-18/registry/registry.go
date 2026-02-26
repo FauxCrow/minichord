@@ -110,9 +110,6 @@ func (r *Registry) RemoveMessanger(key int32, givenAddress string) (string, erro
 	if _, exists := r.messangers[key]; !exists {
 		return "Key does not exist in Registry.", fmt.Errorf("Invalid Key")
 	}
-	// if r.messangers[key] != givenAddress {
-	// 	return "Address does not match key.", fmt.Errorf("Address Mismatch")
-	// }
 
 	// Remove messanger key
 	delete(r.messangers, key)
@@ -182,29 +179,18 @@ func HandleIncomingMessage(conn net.Conn, r *Registry) {
 		if registerReq := message.GetRegistration(); registerReq != nil {
 			actualAddress := conn.RemoteAddr().String()
 
-			// Guard Clause: mismatch of given and actual address
-			// if actualAddress != registerReq.Address {
-			// 	fmt.Println("Address Mismatch")
-			// }
-
 			id, info, _ := r.AddMessanger(registerReq.Address, actualAddress)
 
 			err := HandleRegistration(conn, id, info)
 			if err != nil {
-				// TODO: in the rare case that a messaging node fails just after it sends a registration request, the registry cannot communicate with it.
+				// In the rare case that a messaging node fails just after it sends a registration request, the registry cannot communicate with it.
 				// In this case, the registry removes the entry of the messaging node from the data structure maintained at the registry.
+				fmt.Printf("Failed to send RegistrationResponse to %s: %v. Cleaning up...\n", registerReq.Address, err)
+				r.RemoveMessanger(id, registerReq.Address)
 			}
 			// Case 2: Deregistration
 		} else if deregisterReq := message.GetDeregistration(); deregisterReq != nil {
-			//actualAddress := conn.RemoteAddr().String()
-			//
-			// Guard Clause: mismatch of given and actual address
-			// if actualAddress != deregisterReq.Address {
-			// 	fmt.Println("Address Mismatch")
-			// }
-
 			info, _ := r.RemoveMessanger(deregisterReq.Id, deregisterReq.Address)
-
 			HandleDeregistration(conn, deregisterReq.Id, info)
 		}
 	}
