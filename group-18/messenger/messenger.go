@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	minichord "github.com/mkyas/minichord/packages"
+	minichord "github.com/mkyas/minichord"
 )
 
 // Node information storage
