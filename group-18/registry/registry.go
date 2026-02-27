@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	minichord "github.com/mkyas/minichord"
 )
@@ -400,6 +401,7 @@ func (r *Registry) Start(n int) {
 	// create list of addresses to send instruction to InitiateTask
 	addrByID := make(map[int32]string, len(r.messangers))
 	for id, addr := range r.messangers {
+		fmt.Printf("addr: %v\n", addr)
 		addrByID[id] = addr
 	}
 
@@ -442,6 +444,7 @@ func (r *Registry) completedTask(tf *minichord.TaskFinished) {
 	fmt.Printf("Task completed from node %d (%d/%d)\n", tf.Id, done, total)
 
 	if done == total && total > 0 {
+		time.Sleep(5 * time.Second)
 		r.requestTrafficSummaries()
 	}
 }

@@ -396,6 +396,7 @@ func (n *Node) sendTrafficSummary() error {
 
 	conn, err := net.Dial("tcp", n.registryAddress)
 	if err != nil {
+		fmt.Println("sendTrafficSummary | dial error")
 		return err
 	}
 
@@ -429,6 +430,7 @@ func (n *Node) sendTrafficSummary() error {
 
 	err = minichord.SendMiniChordMessage(conn, msg)
 	if err != nil {
+		fmt.Println("traffic summary send chord error")
 		return err
 	}
 
@@ -569,9 +571,7 @@ func main() {
 		cmd, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				// wont this just keep blocking lol
-				//select {}
-				break
+				select {}
 			}
 			fmt.Println("Reader error:", err)
 			break
