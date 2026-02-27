@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 
 	minichord "github.com/mkyas/minichord/packages"
 )
@@ -25,6 +26,8 @@ type Node struct {
 	relayTracker     uint32 // number of packets the node relays
 	sendSummation    int64  // continuously sums the values of the random numbers sent
 	receiveSummation int64  // accumulates the values of the payloads received
+
+	mut sync.Mutex // guard read writes for messanger, block everyone else when using the shared variable
 }
 
 // handles creation and sending of registration message using protobuf
@@ -51,9 +54,14 @@ func RegisterSelf(conn net.Conn, address string) {
 // handles creation and sending of deregistration message using protobuf
 func DeregisterSelf(conn net.Conn, n *Node) {
 	// Initialise a deregistration request
+	n.mut.Lock()
+	id := n.id
+	address := n.address
+	n.mut.Unlock()
+
 	deregisterReq := &minichord.Deregistration{
-		Id:      n.id,
-		Address: n.address,
+		Id:      id,
+		Address: address,
 	}
 
 	// Create Minichord, where message is assignable to MiniChord_Deregistration type
@@ -74,8 +82,13 @@ func DeregisterSelf(conn net.Conn, n *Node) {
 func (n *Node) runTest(packets int) {
 	for i := 0; i < packets; i++ {
 		payload := rand.Int31()
+
+		n.mut.Lock()
+
 		n.sendTracker++
 		n.sendSummation += int64(payload)
+
+		n.mut.Unlock()
 	}
 
 	n.sendTaskFinished()
@@ -88,28 +101,41 @@ func (n *Node) runTest(packets int) {
 func (n *Node) sendPackets(packets int) {
 	// each loop represents a round
 	for i := 0; i < packets; i++ {
+		n.mut.Lock()
+
+		ids := append([]int32(nil), n.allIDs...)
+		selfID := n.id
+
+		n.mut.Unlock()
+
+		if len(ids) <= 1 {
+			fmt.Println("Not enough nodes")
+			break
+		}
+
 		// Pick a random target until it is not itself
 		var targetID int32
 		for {
-			targetID = n.allIDs[rand.Intn(len(n.allIDs))]
-			if targetID != n.id {
+			targetID = ids[rand.Intn(len(ids))]
+			if targetID != selfID {
 				break
 			}
 		}
 
 		// choose random payload number and update statistics
 		payload := int32(rand.Uint32())
-		n.sendTracker++
-		n.sendSummation += int64(payload)
-
 		// choose who to send this packet to using finger table
 		hopAddr := n.FindBestTarget(targetID)
+		if hopAddr == "" {
+			fmt.Println("No valid hop, table does not exist")
+			continue
+		}
 
 		// sends a NodeData to next node
 		var hops []int32
 		data := &minichord.NodeData{
 			Destination: targetID,
-			Source:      n.id,
+			Source:      selfID,
 			Payload:     payload,
 			Hops:        0,
 			Trace:       hops,
@@ -132,7 +158,15 @@ func (n *Node) sendPackets(packets int) {
 		conn.Close()
 		if err != nil {
 			fmt.Printf("Failed to continue hop to %d", targetID)
+			continue
 		}
+
+		// increment after sending
+		n.mut.Lock()
+		n.sendTracker++
+		n.sendSummation += int64(payload)
+		n.mut.Unlock()
+
 	}
 	n.sendTaskFinished()
 }
@@ -145,24 +179,31 @@ func clockwiseDistance(from int32, to int32) int32 {
 }
 
 func (n *Node) FindBestTarget(targetID int32) string {
-	if len(n.fingerTable) == 0 {
+	n.mut.Lock()
+
+	selfID := n.id
+	table := append([]*minichord.Deregistration(nil), n.fingerTable...)
+
+	n.mut.Unlock()
+
+	if len(table) == 0 {
 		return ""
 	}
 
 	// exact match
-	for _, peer := range n.fingerTable {
+	for _, peer := range table {
 		if peer.Id == targetID {
 			return peer.Address
 		}
 	}
 
-	calculateDist := clockwiseDistance(n.id, targetID)
+	calculateDist := clockwiseDistance(selfID, targetID)
 
-	bestPeer := n.fingerTable[0]
+	bestPeer := table[0]
 	bestLeftover := int32(1<<30 - 1)
 
-	for _, peer := range n.fingerTable {
-		peerDist := clockwiseDistance(n.id, peer.Id)
+	for _, peer := range table {
+		peerDist := clockwiseDistance(selfID, peer.Id)
 
 		// skip 0 dist
 		if peerDist == 0 {
@@ -195,15 +236,23 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 		// Case 1: Setup - Node Overlay
 		if nodeRegistry := message.GetNodeRegistry(); nodeRegistry != nil {
 			fmt.Printf("\nReceived updated finger table with %d entries.\n", nodeRegistry.NR)
-			n.fingerTable = nodeRegistry.Peers
-			n.allIDs = nodeRegistry.Ids
+			// copy the values and try not to hold, i suspect it might block for too long
+			peers := append([]*minichord.Deregistration(nil), nodeRegistry.Peers...)
+			ids := append([]int32(nil), nodeRegistry.Ids...)
+
+			n.mut.Lock()
+
+			n.fingerTable = peers
+			n.allIDs = ids
+
+			n.mut.Unlock()
 
 			// Initiate connections to the nodes that comprise its finger table, and track how many succeed
 			success := 0
-			for _, peer := range n.fingerTable {
-				pConn, err := net.Dial("tcp", peer.Address)
-				if err != nil {
-					fmt.Printf("Failed to connect to peer %d at %s: %v\n", peer.Id, peer.Address, err)
+			for _, peer := range peers {
+				pConn, pconerr := net.Dial("tcp", peer.Address)
+				if pconerr != nil {
+					fmt.Printf("Failed to connect to peer %d at %s: %v\n", peer.Id, peer.Address, pconerr)
 					continue
 				}
 				pConn.Close()
@@ -214,7 +263,7 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 			result := int32(0)
 			info := "Received"
 
-			if success != len(n.fingerTable) {
+			if success != len(peers) {
 				result = -1
 				info = "Unable to connect to all finger table peers"
 			}
@@ -243,20 +292,40 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 			//go n.runTest(int(task.Packets))
 			go n.sendPackets(int(task.Packets))
 		} else if data := message.GetNodeData(); data != nil {
+
+			n.mut.Lock()
+
+			selfID := n.id
+
+			n.mut.Unlock()
 			// Final destination -- update stats
-			if data.Destination == n.id {
+			if data.Destination == selfID {
+				n.mut.Lock()
 				n.receiveTracker++
 				n.receiveSummation += int64(data.Payload)
+				n.mut.Unlock()
 			} else {
+				n.mut.Lock()
 				n.relayTracker++
+				n.mut.Unlock()
+
 				data.Hops++
-				data.Trace = append(data.Trace, n.id)
+				data.Trace = append(data.Trace, selfID)
 
 				// Find next best hop and send it on its merry way
 				hopAddr := n.FindBestTarget(data.Destination)
+				// guard against empty table cause there is a return "" in registry
+				if hopAddr == "" {
+					fmt.Println("No valid hop, table does not exist")
+					return
+				}
 
 				// Open connection to that node
-				conn, _ := net.Dial("tcp", hopAddr)
+				conn, conErr := net.Dial("tcp", hopAddr)
+				if conErr != nil {
+					fmt.Printf("Dail failed for next node %s: %v\n", hopAddr, conErr)
+					return
+				}
 
 				dataPacket := &minichord.MiniChord{
 					Message: &minichord.MiniChord_NodeData{
@@ -265,8 +334,9 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 				}
 
 				err := minichord.SendMiniChordMessage(conn, dataPacket)
+				conn.Close()
 				if err != nil {
-					fmt.Printf("Failed to continue hop to %d", data.Destination)
+					fmt.Printf("Failed to continue hop to %d: %v\n", data.Destination, err)
 				}
 			}
 		}
@@ -275,12 +345,23 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 
 // Print information to the console about the number of messages sent, received, and relayed, along with the sums for the messages sent from and received at the node.
 func Print(n *Node) {
-	fmt.Printf("Node %d\n", n.id)
-	fmt.Printf("Sent: %d\n", n.sendTracker)
-	fmt.Printf("Received: %d\n", n.receiveTracker)
-	fmt.Printf("Relayed: %d\n", n.relayTracker)
-	fmt.Printf("Sum Sent: %d\n", n.sendSummation)
-	fmt.Printf("Sum Received: %d\n", n.receiveSummation)
+	n.mut.Lock()
+
+	id := n.id
+	sendTracker := n.sendTracker
+	receiveTracker := n.receiveTracker
+	relayTracker := n.relayTracker
+	sendSummation := n.sendSummation
+	receiveSummation := n.receiveSummation
+
+	n.mut.Unlock()
+
+	fmt.Printf("Node %d\n", id)
+	fmt.Printf("Sent: %d\n", sendTracker)
+	fmt.Printf("Received: %d\n", receiveTracker)
+	fmt.Printf("Relayed: %d\n", relayTracker)
+	fmt.Printf("Sum Sent: %d\n", sendSummation)
+	fmt.Printf("Sum Received: %d\n", receiveSummation)
 }
 
 // helpers after node finishes sending assigned packets, to send data to registry
@@ -289,12 +370,16 @@ func (n *Node) sendTaskFinished() error {
 	if err != nil {
 		return err
 	}
+	n.mut.Lock()
+	id := n.id
+	address := n.address
+	n.mut.Unlock()
 
 	defer conn.Close()
 
 	tf := &minichord.TaskFinished{
-		Id:      n.id,
-		Address: n.address,
+		Id:      id,
+		Address: address,
 	}
 
 	msg := &minichord.MiniChord{
@@ -316,13 +401,24 @@ func (n *Node) sendTrafficSummary() error {
 
 	defer conn.Close()
 
+	n.mut.Lock()
+	// copy values over
+	id := n.id
+	sent := n.sendTracker
+	received := n.receiveTracker
+	relayed := n.relayTracker
+	TotalSent := n.sendSummation
+	TotalReceived := n.receiveSummation
+
+	n.mut.Unlock()
+
 	ts := &minichord.TrafficSummary{
-		Id:            n.id,
-		Sent:          n.sendTracker,
-		Received:      n.receiveTracker,
-		Relayed:       n.relayTracker,
-		TotalSent:     n.sendSummation,
-		TotalReceived: n.receiveSummation,
+		Id:            id,
+		Sent:          sent,
+		Received:      received,
+		Relayed:       relayed,
+		TotalSent:     TotalSent,
+		TotalReceived: TotalReceived,
 	}
 
 	msg := &minichord.MiniChord{
@@ -336,12 +432,16 @@ func (n *Node) sendTrafficSummary() error {
 		return err
 	}
 
+	n.mut.Lock()
+
 	// reset counters after sending
 	n.sendTracker = 0
 	n.receiveTracker = 0
 	n.relayTracker = 0
 	n.sendSummation = 0
 	n.receiveSummation = 0
+
+	n.mut.Unlock()
 
 	return nil
 }
@@ -397,9 +497,13 @@ func main() {
 	}
 
 	// Split the port from the host before we save that information in the registry
-	_, port, _ := net.SplitHostPort(listener.Addr().String())
+	_, port, portErr := net.SplitHostPort(listener.Addr().String())
+	if portErr != nil {
+		fmt.Println("Failed to get a listener port:", portErr)
+		return
+	}
 	// might need to modify this later
-	fullAddress := "127.0.0.1:" + port
+	// fullAddress := "127.0.0.1:" + port
 
 	// Establish connection with registry
 	conn, err := net.Dial("tcp", target)
@@ -408,6 +512,14 @@ func main() {
 		return
 	}
 	defer conn.Close()
+
+	lhost, _, lisErr := net.SplitHostPort(conn.LocalAddr().String())
+	if lisErr != nil {
+		fmt.Println("failed to get listener host from registry error:", lisErr)
+		return
+	}
+
+	fullAddress := net.JoinHostPort(lhost, port)
 
 	// Registeration - initiate contact with registry
 	RegisterSelf(conn, fullAddress)
@@ -421,9 +533,17 @@ func main() {
 
 	// Check if connection works
 	if response := regResponse.GetRegistrationResponse(); response != nil {
+		// guard against failed connection
+		if response.Result < 0 {
+			fmt.Printf("Registration failed :%s\n", response.Info)
+			return
+		}
 		n.id = response.Result
 		n.address = fullAddress
 		fmt.Printf("Registration of %d successful at %s", n.id, fullAddress)
+	} else {
+		fmt.Println("Did not receive reply registration")
+		return
 	}
 
 	// listen for connections in separate goroutine -- so we can still look for user inputs while this runs
@@ -449,7 +569,9 @@ func main() {
 		cmd, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				select {}
+				// wont this just keep blocking lol
+				//select {}
+				break
 			}
 			fmt.Println("Reader error:", err)
 			break
