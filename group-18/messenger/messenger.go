@@ -111,7 +111,7 @@ func (n *Node) sendPackets(packets int) {
 			Destination: targetID,
 			Source:      n.id,
 			Payload:     payload,
-			Hops:        1,
+			Hops:        0,
 			Trace:       hops,
 		}
 
@@ -122,8 +122,14 @@ func (n *Node) sendPackets(packets int) {
 		}
 
 		// Open connection to that node
-		conn, _ := net.Dial("tcp", hopAddr)
+		conn, dialErr := net.Dial("tcp", hopAddr)
+		if dialErr != nil {
+			fmt.Printf("Failed to dial heop %s: %v\n", hopAddr, dialErr)
+			continue
+		}
+
 		err := minichord.SendMiniChordMessage(conn, dataPacket)
+		conn.Close()
 		if err != nil {
 			fmt.Printf("Failed to continue hop to %d", targetID)
 		}
@@ -131,13 +137,51 @@ func (n *Node) sendPackets(packets int) {
 	n.sendTaskFinished()
 }
 
+func clockwiseDistance(from int32, to int32) int32 {
+	if to >= from {
+		return to - from
+	}
+	return (1024 - from) + to
+}
+
 func (n *Node) FindBestTarget(targetID int32) string {
-	successor := n.fingerTable[0]
+	if len(n.fingerTable) == 0 {
+		return ""
+	}
 
-	// Intuition: find a peer it can talk to that is closest to the target
-	// TODO: Figuring out the math behind the hops tomorrow lol
+	// exact match
+	for _, peer := range n.fingerTable {
+		if peer.Id == targetID {
+			return peer.Address
+		}
+	}
 
-	return successor.Address
+	calculateDist := clockwiseDistance(n.id, targetID)
+
+	bestPeer := n.fingerTable[0]
+	bestLeftover := int32(1<<30 - 1)
+
+	for _, peer := range n.fingerTable {
+		peerDist := clockwiseDistance(n.id, peer.Id)
+
+		// skip 0 dist
+		if peerDist == 0 {
+			continue
+		}
+
+		// dont overshoot
+		if peerDist > calculateDist {
+			continue
+		}
+
+		remaining := clockwiseDistance(peer.Id, targetID)
+		if remaining < bestLeftover {
+			bestLeftover = remaining
+			bestPeer = peer
+		}
+	}
+
+	return bestPeer.Address
 }
 
 func HandleIncomingMessage(conn net.Conn, n *Node) {
@@ -321,10 +365,14 @@ func (n *Node) Exit() error {
 
 	// Check if connection works
 	if response := deregResponse.GetDeregistrationResponse(); response != nil {
+		if response.Result < 0 {
+			return fmt.Errorf(response.Info)
+		}
 		fmt.Printf("Deregistration of %d successful at %s", n.id, n.address)
+		return nil
 	}
 
-	return nil
+	return fmt.Errorf("uncaught error here")
 }
 
 // Main program ------------------------------------------------------------------------------------
@@ -412,9 +460,13 @@ func main() {
 		case "print":
 			Print(n)
 		case "exit":
-			n.Exit()
+			if err := n.Exit(); err != nil {
+				fmt.Println("exit error:", err)
+			}
+			return
+
 		default:
-			fmt.Printf("Command not understood: %s", cmd)
+			fmt.Printf("Command not understood: %s\n", cmd)
 		}
 	}
 }
