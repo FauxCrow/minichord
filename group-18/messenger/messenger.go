@@ -20,11 +20,11 @@ type Node struct {
 	fingerTable     []*minichord.Deregistration // list of IDs
 	allIDs          []int32
 
-	sendTracker    uint32
-	receiveTracker uint32
-	relayTracker   uint32
-	sendSummation  int64
-	recvSummation  int64
+	sendTracker      uint32 // number of data packets sent by that node
+	receiveTracker   uint32 // number of received packets
+	relayTracker     uint32 // number of packets the node relays
+	sendSummation    int64  // continuously sums the values of the random numbers sent
+	receiveSummation int64  // accumulates the values of the payloads received
 }
 
 // handles creation and sending of registration message using protobuf
@@ -81,6 +81,65 @@ func (n *Node) runTest(packets int) {
 	n.sendTaskFinished()
 }
 
+// Each node participates in a set of rounds. Each round involves sending a packet to a randomly chosen node (excluding itself) from the set of all registered nodes advertised in the message NodeRegistry.
+// When sending a data packet, the source node consults its finger table to decide which link to send it over
+// The payload of each data packet is a random integer with values that range from 2147483647 to −2147483648.
+// Each node sends one packet during each round.
+func (n *Node) sendPackets(packets int) {
+	// each loop represents a round
+	for i := 0; i < packets; i++ {
+		// Pick a random target until it is not itself
+		var targetID int32
+		for {
+			targetID = n.allIDs[rand.Intn(len(n.allIDs))]
+			if targetID != n.id {
+				break
+			}
+		}
+
+		// choose random payload number and update statistics
+		payload := int32(rand.Uint32())
+		n.sendTracker++
+		n.sendSummation += int64(payload)
+
+		// choose who to send this packet to using finger table
+		hopAddr := n.FindBestTarget(targetID)
+
+		// sends a NodeData to next node
+		var hops []int32
+		data := &minichord.NodeData{
+			Destination: targetID,
+			Source:      n.id,
+			Payload:     payload,
+			Hops:        1,
+			Trace:       hops,
+		}
+
+		dataPacket := &minichord.MiniChord{
+			Message: &minichord.MiniChord_NodeData{
+				NodeData: data,
+			},
+		}
+
+		// Open connection to that node
+		conn, _ := net.Dial("tcp", hopAddr)
+		err := minichord.SendMiniChordMessage(conn, dataPacket)
+		if err != nil {
+			fmt.Printf("Failed to continue hop to %d", targetID)
+		}
+	}
+	n.sendTaskFinished()
+}
+
+func (n *Node) FindBestTarget(targetID int32) string {
+	successor := n.fingerTable[0]
+
+	// Intuition: find a peer it can talk to that is closest to the target
+	// TODO: Figuring out the math behind the hops tomorrow lol
+
+	return successor.Address
+}
+
 func HandleIncomingMessage(conn net.Conn, n *Node) {
 	for {
 		message, err := minichord.ReceiveMiniChordMessage(conn)
@@ -133,23 +192,51 @@ func HandleIncomingMessage(conn net.Conn, n *Node) {
 			if err != nil {
 				fmt.Println("Failure informing on node registry setup from: " + n.address)
 			}
-		} else if message.GetReportTrafficSummary() != nil {
+		} else if summary := message.GetRequestTrafficSummary(); summary != nil {
 			n.sendTrafficSummary()
 		} else if task := message.GetInitiateTask(); task != nil {
 			fmt.Printf("Received InitiateTask: %d packets \n", task.Packets)
-			go n.runTest(int(task.Packets))
+			//go n.runTest(int(task.Packets))
+			go n.sendPackets(int(task.Packets))
+		} else if data := message.GetNodeData(); data != nil {
+			// Final destination -- update stats
+			if data.Destination == n.id {
+				n.receiveTracker++
+				n.receiveSummation += int64(data.Payload)
+			} else {
+				n.relayTracker++
+				data.Hops++
+				data.Trace = append(data.Trace, n.id)
+
+				// Find next best hop and send it on its merry way
+				hopAddr := n.FindBestTarget(data.Destination)
+
+				// Open connection to that node
+				conn, _ := net.Dial("tcp", hopAddr)
+
+				dataPacket := &minichord.MiniChord{
+					Message: &minichord.MiniChord_NodeData{
+						NodeData: data,
+					},
+				}
+
+				err := minichord.SendMiniChordMessage(conn, dataPacket)
+				if err != nil {
+					fmt.Printf("Failed to continue hop to %d", data.Destination)
+				}
+			}
 		}
 	}
 }
 
-// TODO: print information to the console about the number of messages sent, received, and relayed, along with the sums for the messages sent from and received at the node.
+// Print information to the console about the number of messages sent, received, and relayed, along with the sums for the messages sent from and received at the node.
 func Print(n *Node) {
 	fmt.Printf("Node %d\n", n.id)
 	fmt.Printf("Sent: %d\n", n.sendTracker)
 	fmt.Printf("Received: %d\n", n.receiveTracker)
 	fmt.Printf("Relayed: %d\n", n.relayTracker)
 	fmt.Printf("Sum Sent: %d\n", n.sendSummation)
-	fmt.Printf("Sum Received: %d\n", n.recvSummation)
+	fmt.Printf("Sum Received: %d\n", n.receiveSummation)
 }
 
 // helpers after node finishes sending assigned packets, to send data to registry
@@ -176,6 +263,8 @@ func (n *Node) sendTaskFinished() error {
 }
 
 func (n *Node) sendTrafficSummary() error {
+	fmt.Printf("Attempting to send traffic summary...\n")
+
 	conn, err := net.Dial("tcp", n.registryAddress)
 	if err != nil {
 		return err
@@ -189,7 +278,7 @@ func (n *Node) sendTrafficSummary() error {
 		Received:      n.receiveTracker,
 		Relayed:       n.relayTracker,
 		TotalSent:     n.sendSummation,
-		TotalReceived: n.recvSummation,
+		TotalReceived: n.receiveSummation,
 	}
 
 	msg := &minichord.MiniChord{
@@ -208,12 +297,12 @@ func (n *Node) sendTrafficSummary() error {
 	n.receiveTracker = 0
 	n.relayTracker = 0
 	n.sendSummation = 0
-	n.recvSummation = 0
+	n.receiveSummation = 0
 
 	return nil
 }
 
-// TODO: allows a messaging node to exit the overlay. The messaging node should first send a deregistration message (see Section 2.2) to the registry and await a response before exiting and terminating the process.
+// Allows a messaging node to exit the overlay. The messaging node should first send a deregistration message (see Section 2.2) to the registry and await a response before exiting and terminating the process.
 func (n *Node) Exit() error {
 	conn, err := net.Dial("tcp", n.registryAddress)
 	if err != nil {

@@ -381,7 +381,7 @@ func (r *Registry) setupNR(nr int) error {
 	return nil
 }
 
-// TODO: Helper: The start command makes the registry send the message TaskInitiate message to all nodes registered in the overlay. A command of start 50 results in each messaging node sending 50 packets to randomly chosen nodes.
+// The start command makes the registry send the message TaskInitiate message to all nodes registered in the overlay. A command of start 50 results in each messaging node sending 50 packets to randomly chosen nodes.
 func (r *Registry) Start(n int) {
 	//sending a message InitiateTask control message to all nodes
 	if n <= 0 {
@@ -397,6 +397,7 @@ func (r *Registry) Start(n int) {
 
 	r.mutex.RLock()
 
+	// create list of addresses to send instruction to InitiateTask
 	addrByID := make(map[int32]string, len(r.messangers))
 	for id, addr := range r.messangers {
 		addrByID[id] = addr
@@ -404,6 +405,7 @@ func (r *Registry) Start(n int) {
 
 	r.mutex.RUnlock()
 
+	// send intruction to all nodes sequentially
 	for id, addr := range addrByID {
 		task := &minichord.InitiateTask{
 			Packets: uint32(n),
@@ -467,10 +469,11 @@ func (r *Registry) requestTrafficSummaries() {
 		}
 
 		err = minichord.SendMiniChordMessage(conn, msg)
-		conn.Close()
 		if err != nil {
 			fmt.Printf("summary | send error for node %d at %s: %v\n", id, addr, err)
 		}
+
+		conn.Close()
 	}
 }
 
