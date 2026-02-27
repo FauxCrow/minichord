@@ -4,6 +4,8 @@ set -euo pipefail
 # Configure setup variables
 REGISTRY_HOST=127.0.0.1
 REGISTRY_PORT=3000
+# run the 10th node manually to test print and exit,
+# otherwise it's non-interactive
 NODES=9
 
 # Setup messagers based on NODES number
